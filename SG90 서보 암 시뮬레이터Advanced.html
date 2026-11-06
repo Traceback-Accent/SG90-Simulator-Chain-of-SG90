@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SG90 서보 암 시뮬레이터</title>
+<style>
+:root{--bg:#f6f6f3;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#d8d8d2;--acc:#d9480f;--rect:#e7f0ff;--rs:#2f6fdb;--arm:#222;--ok:#2b9348;--warn:#e8a600;--bad:#d62828;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--fg:#eee;--mut:#9a9a94;--card:#222220;--line:#3a3a36;--acc:#ff8a4c;--rect:#1c2a44;--rs:#6ea2ff;--arm:#ddd;--ok:#4cc26a;--warn:#ffc83d;--bad:#ff6b6b;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161615;--fg:#eee;--mut:#9a9a94;--card:#222220;--line:#3a3a36;--acc:#ff8a4c;--rect:#1c2a44;--rs:#6ea2ff;--arm:#ddd;--ok:#4cc26a;--warn:#ffc83d;--bad:#ff6b6b;color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Noto Sans KR",sans-serif;padding:16px;max-width:760px}
+h1{font-size:18px;margin:0 0 4px}h2{font-size:14px;margin:14px 0 6px}p{color:var(--mut);font-size:13px;margin:0 0 10px;line-height:1.5}
+canvas{width:100%;background:var(--card);border:1px solid var(--line);border-radius:10px;touch-action:none;display:block;cursor:crosshair}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:10px 0;font-size:14px}
+label{display:flex;flex-direction:column;font-size:12px;color:var(--mut);gap:2px}
+input[type=number]{width:74px;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
+input[type=range]{width:140px}
+button{padding:7px 12px;border:0;border-radius:6px;background:var(--acc);color:#fff;cursor:pointer}
+.info{font-size:13px;line-height:1.7}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums;width:100%}
+th,td{padding:4px 6px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad);font-weight:600}
+</style>
+</head>
+<body>
+<h1>SG90 서보 암 시뮬레이터</h1>
+<p>베이스 (0,-5) · 5cm 링크 9개 × SG90 9개 · 세로 평면(중력 -y) · 사각형 안을 클릭/드래그하세요. 서보 색: 초록(여유) / 노랑(60%↑) / 빨강(사용 토크 초과).</p>
+<canvas id="c" width="700" height="525"></canvas>
+<div class="row">
+ <label>X<input id="x" type="number" value="15" step="1"></label>
+ <label>Y<input id="y" type="number" value="20" step="1"></label>
+ <button id="go">이동</button>
+</div>
+<div class="info" id="info"></div>
+<h2>물리 설정</h2>
+<div class="row">
+ <label>정격(스톨) 토크 kg·cm<input id="p_tau" type="number" value="1.8" step="0.1"></label>
+ <label>사용 가능 비율 %<input id="p_use" type="number" value="60" step="5"></label>
+ <label>서보 무게 g<input id="p_ms" type="number" value="9" step="1"></label>
+ <label>링크 무게 g<input id="p_ml" type="number" value="2" step="1"></label>
+ <label>끝 하중 g<input id="p_pay" type="number" value="5" step="1"></label>
+ <label>속도 제한 % <input id="p_spd" type="range" min="5" max="100" value="30"></label>
+</div>
+<div class="tbl"><table id="tb"></table></div>
+<p>가정: SG90(4.8~5V) 스톨 토크 1.8kg·cm, 무부하 0.1s/60°(≈600°/s), 펄스 500~2400µs = 0~180°, 데드밴드·기어 백래시 합 약 ±1.5°, 스톨 전류 약 0.65A, 정지 약 10mA. 토크는 각 관절을 중심으로 아래쪽 모든 질량의 중력 모멘트로 계산합니다. 실제로는 플라스틱 기어 보호를 위해 사용 가능 비율을 50~60% 이하로 두는 것이 안전합니다.</p>
+<script>
+const N=9,L=5,BASE=[0,-5],RX=25,RY=30,D=3;
+const P={tau:1.8,use:0.6,ms:9,ml:2,pay:5,spd:0.3};
+const VFREE=10.472; // rad/s (600deg/s)
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const S=cv.width/60,OX=cv.width/2,OY=cv.height-10*S;
+const W=(x,y)=>[OX+x*S,OY-y*S];
+let theta=Array(N).fill(0),cur=Array(N).fill(0),target=[15,20],wp=[15,20],settled=true,clipped=false,tried=false,queue=[],req=[15,20];
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+function joints(t){let a=Math.PI/2,p=[...BASE],r=[p];
+ for(let i=0;i<N;i++){a+=t[i];p=[p[0]+L*Math.cos(a),p[1]+L*Math.sin(a)];r.push(p)}return r}
+function loads(t){ // kg·cm (중력 모멘트)
+ const j=joints(t),r=[];
+ for(let i=0;i<N;i++){const xi=j[i][0];let m=0;
+  for(let k=i+1;k<N;k++)m+=P.ms*(j[k][0]-xi);
+  for(let k=i;k<N;k++)m+=P.ml*((j[k][0]+j[k+1][0])/2-xi);
+  m+=P.pay*(j[N][0]-xi);
+  r.push(Math.abs(m)/1000)}
+ return r}
+const usable=()=>P.tau*P.use,SAFE=0.9; // 최적화 때 한계의 90%만 사용(양자화·오차 여유)
+function over(t){const u=usable()*SAFE;let s=0,q=0;for(const x of loads(t)){const r=x/u;if(r>1)s+=r-1;q+=r*r}return[s,q]}
+// 충돌
+function pSeg(p,a,b){const dx=b[0]-a[0],dy=b[1]-a[1];const u=clamp(((p[0]-a[0])*dx+(p[1]-a[1])*dy)/(dx*dx+dy*dy),0,1);return Math.hypot(p[0]-a[0]-u*dx,p[1]-a[1]-u*dy)}
+function cr(a,b,c){return(b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0])}
+function segD(a,b,c,d){
+ if(cr(a,b,c)*cr(a,b,d)<0&&cr(c,d,a)*cr(c,d,b)<0)return 0;
+ return Math.min(pSeg(a,c,d),pSeg(b,c,d),pSeg(c,a,b),pSeg(d,a,b))}
+function col(t){const j=joints(t);let s=0;
+ for(let i=0;i<N;i++)for(let k=i+2;k<N;k++){const d=segD(j[i],j[i+1],j[k],j[k+1]);if(d<D)s+=D-d}
+ return s}
+// 역기구학
+function ccd(t,tg){
+ for(let it=0;it<40;it++)for(let i=N-1;i>=0;i--){
+  const j=joints(t),e=j[N],o=j[i];
+  const ax=e[0]-o[0],ay=e[1]-o[1],bx=tg[0]-o[0],by=tg[1]-o[1];
+  t[i]=clamp(t[i]+Math.atan2(ax*by-ay*bx,ax*bx+ay*by),-Math.PI/2,Math.PI/2)}}
+function dls(t,tg,n=40){
+ for(let it=0;it<n;it++){
+  const j=joints(t),E=j[N],ex=tg[0]-E[0],ey=tg[1]-E[1];
+  if(Math.hypot(ex,ey)<0.01)break;
+  let a=4,b=0,c=4;const J=[];
+  for(let i=0;i<N;i++){const jx=-(E[1]-j[i][1]),jy=E[0]-j[i][0];J.push([jx,jy]);a+=jx*jx;b+=jx*jy;c+=jy*jy}
+  const det=a*c-b*b,y0=(c*ex-b*ey)/det,y1=(-b*ex+a*ey)/det;
+  for(let i=0;i<N;i++){const d=clamp(J[i][0]*y0+J[i][1]*y1,-0.15,0.15);t[i]=clamp(t[i]+d,-Math.PI/2,Math.PI/2)}}}
+function err(t,tg){const e=joints(t)[N];return Math.hypot(e[0]-tg[0],e[1]-tg[1])}
+function cost(t,tg,ref){
+ const u=usable()*SAFE,r=loads(t).map(x=>x/u);let mx=0,sq=0,os=0,sum=0,dist=0;
+ for(let i=0;i<N;i++){mx=Math.max(mx,r[i]);sq+=r[i]*r[i];if(r[i]>1)os+=r[i]-1;sum+=t[i]*t[i];if(ref)dist+=(t[i]-ref[i])**2}
+ return err(t,tg)*400+col(t)*300+os*150+mx*30+sq*5+sum*0.5+dist*3}
+// 영공간 탐색: 끝점은 유지하면서 토크가 더 낮은 자세로 개선
+function polish(t,tg,n,step){
+ let c=cost(t,tg);
+ for(let k=0;k<n;k++){const s=t.slice();
+  for(let m=0;m<2;m++){const i=Math.random()*N|0;s[i]=clamp(s[i]+(Math.random()*2-1)*step,-Math.PI/2,Math.PI/2)}
+  dls(s,tg,8);const c2=cost(s,tg);
+  if(c2<c){c=c2;for(let i=0;i<N;i++)t[i]=s[i]}}}
+function solve(t,tg){
+ const d0=t.slice();dls(d0,tg);
+ const seeds=[t.slice(),d0];
+ for(let b=-90;b<=90;b+=15)for(let k=-0.3;k<=0.31;k+=0.1){const s=Array(N).fill(k);s[0]=b*Math.PI/180;seeds.push(s)}
+ let best=null,bc=1e9;
+ for(const s of seeds){ccd(s,tg);dls(s,tg);const c=cost(s,tg,t);if(c<bc){bc=c;best=s}}
+ polish(best,tg,250,0.2);polish(best,tg,250,0.05);
+ for(let i=0;i<N;i++)t[i]=best[i]}
+function pathMax(a,b){const u=usable()*SAFE;let m=0;
+ for(let k=0;k<=12;k++){const s=a.map((v,i)=>v+(b[i]-v)*k/12);m=Math.max(m,...loads(s).map(x=>x/u))}return m}
+function setTarget(x,y,snap){
+ target=[clamp(x,-RX,RX),clamp(y,0,RY)];
+ document.getElementById('x').value=target[0].toFixed(1);
+ document.getElementById('y').value=target[1].toFixed(1);
+ clipped=false;tried=false;queue=[];req=target.slice();
+ if(snap){const r=reach(target);clipped=r.cl;target=r.p.slice();wp=r.p.slice();for(let i=0;i<N;i++)theta[i]=r.t[i];settled=true}}
+// 요청 지점이 토크 한계 밖이면, 안전 지점(0,25)과의 선분에서 가장 먼 허용 지점을 이분탐색
+function reach(req){
+ const ok=(s,p)=>over(s)[0]<0.001&&err(s,p)<0.1&&col(s)<0.01;
+ let t=theta.slice();solve(t,req);
+ if(ok(t,req))return{p:req,t,cl:false};
+ const lo=[0,25];let bt=theta.slice(),bp=lo;solve(bt,lo);let a=0,b=1;
+ for(let k=0;k<7;k++){const m=(a+b)/2,p=[lo[0]+(req[0]-lo[0])*m,lo[1]+(req[1]-lo[1])*m],s=theta.slice();solve(s,p);
+  if(ok(s,p)){a=m;bt=s;bp=p}else b=m}
+ return{p:bp,t:bt,cl:true}}
+function feas(t,p){return over(t)[0]<0.001&&col(t)<0.01&&err(t,p)<0.1}
+function lineOk(a,b){for(let k=1;k<=16;k++){const s=a.map((v,i)=>v+(b[i]-v)*k/16);if(over(s)[0]>=0.001||col(s)>=0.01)return false}return true}
+// 우회 경로: 끝점 격자(3cm) 위에서 A*. 각 셀의 자세는 이웃 셀에서 국소 IK로 이어가며, 겁침·토크한계를 어기는 셀은 제외
+function detour(){
+ const G=3,key=(i,j)=>i*100+j,pos=(i,j)=>[-RX+i*G,j*G],gi=Math.round(RX*2/G),gj=Math.round(RY/G);
+ const sc=[clamp(Math.round((wp[0]+RX)/G),0,gi),clamp(Math.round(wp[1]/G),0,gj)],gc=[clamp(Math.round((req[0]+RX)/G),0,gi),clamp(Math.round(req[1]/G),0,gj)];
+ const h=(i,j)=>Math.hypot(i-gc[0],j-gc[1]);
+ const s0={t:theta.slice(),g:0,par:null,i:sc[0],j:sc[1]},best=new Map([[key(sc[0],sc[1]),s0]]),open=[s0],closed=new Set();
+ let found=null;
+ while(open.length){
+  let bi=0;for(let k=1;k<open.length;k++)if(open[k].g+h(open[k].i,open[k].j)<open[bi].g+h(open[bi].i,open[bi].j))bi=k;
+  const c=open.splice(bi,1)[0],kc=key(c.i,c.j);
+  if(closed.has(kc))continue;closed.add(kc);
+  if(c.i==gc[0]&&c.j==gc[1]){found=c;break}
+  for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++){
+   if(!di&&!dj)continue;const ni=c.i+di,nj=c.j+dj;
+   if(ni<0||nj<0||ni>gi||nj>gj||closed.has(key(ni,nj)))continue;
+   const p=pos(ni,nj),t=c.t.slice();dls(t,p,12);polish(t,p,14,0.05);
+   if(!feas(t,p))continue;
+   let jd=0;for(let q=0;q<N;q++)jd+=Math.abs(t[q]-c.t[q]);
+   const g=c.g+Math.hypot(di,dj)+jd*0.5,old=best.get(key(ni,nj));
+   if(!old||g<old.g){const nn={t,g,par:c,i:ni,j:nj};best.set(key(ni,nj),nn);open.push(nn)}}}
+ let q=[];
+ if(found){for(let c=found;c.par;c=c.par)q.unshift({t:c.t,p:pos(c.i,c.j)})}
+ else{ // 격자 실패 시: 수직 대기 자세(토크 0)를 경유
+  const home=Array(N).fill(0),gp=theta.slice();solve(gp,req);
+  if(feas(gp,req)&&lineOk(theta,home)&&lineOk(home,gp))q=[{t:home,p:[0,40]},{t:gp,p:req.slice()}];
+  else return false}
+ queue=q;clipped=false;target=req.slice();return true}
+// 도착 후: 더 가벼운 자세가 있고, 그리로 가는 경로도 안전할 때만 자세 교체
+function refine(){
+ const t=theta.slice();solve(t,target);
+ if(cost(t,target)<cost(theta,target)*0.85&&pathMax(theta,t)<=Math.max(1,pathMax(theta,theta))+0.05)
+  for(let i=0;i<N;i++)theta[i]=t[i]}
+// 서보 변환
+const toDeg=t=>clamp(Math.round(t*180/Math.PI+90),0,180);
+const toUs=d=>Math.round(500+d/180*1900);
+const speedOf=r=>VFREE*P.spd*(1-0.6*Math.min(1,r)); // 부하 시 속도 저하
+function pick(css,n){return css.getPropertyValue(n).trim()}
+let lastT=performance.now(),tbKey='';
+function draw(){
+ const css=getComputedStyle(document.documentElement),g=n=>pick(css,n);
+ // 부하에 따른 속도 제한, 모든 서보 동시 도착
+ const now=performance.now(),dt=Math.min(0.05,(now-lastT)/1000);lastT=now;
+ const u=usable(),lc=loads(cur);
+ // 경로: 끝점 웨이포인트를 목표로 직선 이동시키며 매 프레임 저부하 자세로 추종 (관절이 못 따라오면 대기)
+ let lag=0;for(let i=0;i<N;i++)lag=Math.max(lag,Math.abs(theta[i]-cur[i]));
+ const dW=Math.hypot(target[0]-wp[0],target[1]-wp[1]);
+ if(queue.length){settled=false;if(lag<0.03){const n=queue.shift();for(let i=0;i<N;i++)theta[i]=n.t[i];wp=n.p.slice();if(!queue.length)target=req.slice()}}
+ else if(clipped&&!down&&!tried){tried=true;detour()}
+ else if(dW>1e-3){settled=false;if(lag<0.12){const st=Math.min(dW,Math.max(3,60*P.spd)*dt);
+  const np=[wp[0]+(target[0]-wp[0])/dW*st,wp[1]+(target[1]-wp[1])/dW*st],c=theta.slice();
+  dls(c,np,10);polish(c,np,60,0.05);
+  if(over(c)[0]<0.001&&col(c)<0.01){wp=np;for(let i=0;i<N;i++)theta[i]=c[i]}
+  else{clipped=true;target=wp.slice()} // 한계에 닿으면 그 지점에서 멈춤
+ }}
+ else if(!settled){settled=true;refine()}
+ let sc=1,moving=false;
+ for(let i=0;i<N;i++){const d=Math.abs(theta[i]-cur[i]);if(d>1e-4){moving=true;sc=Math.min(sc,speedOf(lc[i]/u)*dt/d)}}
+ if(moving)for(let i=0;i<N;i++)cur[i]+=(theta[i]-cur[i])*Math.min(1,sc);
+ // 실제 각도(1° 양자화)
+ const deg=cur.map(toDeg),act=deg.map(d=>(d-90)*Math.PI/180);
+ const j=joints(act),ld=loads(act),ratio=ld.map(x=>x/u);
+ ctx.clearRect(0,0,cv.width,cv.height);
+ const [x0,y0]=W(-RX,RY);
+ ctx.fillStyle=g('--rect');ctx.fillRect(x0,y0,50*S,30*S);
+ ctx.strokeStyle=g('--rs');ctx.lineWidth=2;ctx.strokeRect(x0,y0,50*S,30*S);
+ ctx.lineWidth=1;ctx.fillStyle=g('--mut');ctx.font='11px sans-serif';ctx.strokeStyle=g('--line');
+ for(let x=-25;x<=25;x+=5){const px=W(x,0)[0];ctx.beginPath();ctx.moveTo(px,W(0,35)[1]);ctx.lineTo(px,W(0,-10)[1]);ctx.globalAlpha=.4;ctx.stroke();ctx.globalAlpha=1;ctx.fillText(x,px-6,W(0,-7)[1])}
+ for(let y=0;y<=30;y+=5){const py=W(0,y)[1];ctx.beginPath();ctx.moveTo(0,py);ctx.lineTo(cv.width,py);ctx.globalAlpha=.4;ctx.stroke();ctx.globalAlpha=1;ctx.fillText(y,4,py-3)}
+ [[-25,30],[-25,0],[25,0],[25,30]].forEach(([x,y])=>{const[px,py]=W(x,y);ctx.fillStyle=g('--rs');ctx.beginPath();ctx.arc(px,py,3,0,7);ctx.fill();ctx.fillStyle=g('--mut');ctx.fillText(`(${x},${y})`,px+5,py+(y?12:-6))});
+ const[tx,ty]=W(...target);
+ ctx.strokeStyle=g('--acc');ctx.lineWidth=2;ctx.beginPath();ctx.arc(tx,ty,8,0,7);ctx.moveTo(tx-12,ty);ctx.lineTo(tx+12,ty);ctx.moveTo(tx,ty-12);ctx.lineTo(tx,ty+12);ctx.stroke();
+ ctx.strokeStyle=g('--arm');ctx.lineWidth=6;ctx.lineCap='round';ctx.beginPath();
+ j.forEach((p,i)=>{const[px,py]=W(...p);i?ctx.lineTo(px,py):ctx.moveTo(px,py)});ctx.stroke();
+ j.forEach((p,i)=>{const[px,py]=W(...p);
+  const r=i<N?ratio[i]:0,color=i==N?g('--acc'):(r>1?g('--bad'):r>0.6?g('--warn'):g('--ok'));
+  ctx.fillStyle=color;ctx.strokeStyle=g('--arm');ctx.lineWidth=2;ctx.beginPath();ctx.arc(px,py,i==N?6:D/2*S,0,7);ctx.fill();ctx.stroke()});
+ const e=j[N],pr=j[N-1],a=Math.atan2(e[1]-pr[1],e[0]-pr[0]),[ex,ey]=W(...e);
+ ctx.strokeStyle=g('--acc');ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(ex,ey);ctx.lineTo(ex+16*Math.cos(a),ey-16*Math.sin(a));ctx.stroke();
+ // 정보
+ const eT=Math.hypot(e[0]-target[0],e[1]-target[1]);
+ let worst=0;for(let i=0;i<N;i++)worst+=Math.hypot(e[0]-j[i][0],e[1]-j[i][1])*1.5*Math.PI/180;
+ const cI=col(act)>0.01,ov=ratio.some(r=>r>1);
+ let amp=0;for(let i=0;i<N;i++)amp+=0.01+0.65*Math.min(1,ld[i]/P.tau);
+ let tmove=0;for(let i=0;i<N;i++)tmove=Math.max(tmove,Math.abs(theta[i]-act[i])/speedOf(ratio[i]));
+ const cls=(c,t)=>`<span class="${c}">${t}</span>`;
+ document.getElementById('info').innerHTML=
+  `끝점(실제 1° 양자화) (${e[0].toFixed(1)}, ${e[1].toFixed(1)}) · 목표와 차이 ${eT.toFixed(2)}cm · 백래시 포함 최악 ±${worst.toFixed(2)}cm<br>`+
+  (cI?cls('bad','⚠ 서보끼리 겹침'):cls('ok','겹침 없음'))+' · '+
+  (ov?cls('bad','⚠ 토크 초과 (이 위치는 SG90으로 유지 불가)'):cls('ok','토크 허용 범위'))+
+  ` · 최대 사용률 ${(Math.max(...ratio)*100).toFixed(0)}% · 예상 전류 ${amp.toFixed(2)}A (5V 3A 이상 전원 권장) · 남은 이동 약 ${tmove.toFixed(2)}s`+(clipped?'<br>'+cls('warn','⚠ 한계(토크·겹침)를 지키는 경로를 찾지 못해 가장 가까운 허용 지점에서 멈췄습니다'):'');
+ const key=deg.join(',')+P.tau+P.use+P.ms+P.ml+P.pay;
+ if(key!==tbKey){tbKey=key;
+  let h='<tr><th>서보</th><th>각도</th><th>PWM</th><th>토크 kg·cm</th><th>사용률</th></tr>';
+  for(let i=0;i<N;i++){const r=ratio[i],c=r>1?'bad':r>0.6?'warn':'ok';
+   h+=`<tr><td>S${i+1}</td><td>${deg[i]}°</td><td>${toUs(deg[i])}µs</td><td>${ld[i].toFixed(2)} / ${u.toFixed(2)}</td><td class="${c}">${(r*100).toFixed(0)}%</td></tr>`}
+  document.getElementById('tb').innerHTML=h}
+ requestAnimationFrame(draw)}
+function ev(e){const r=cv.getBoundingClientRect(),k=cv.width/r.width;
+ setTarget(((e.clientX-r.left)*k-OX)/S,(OY-(e.clientY-r.top)*k)/S)}
+let down=false;
+cv.addEventListener('pointerdown',e=>{down=true;ev(e)});
+cv.addEventListener('pointermove',e=>{if(down)ev(e)});
+addEventListener('pointerup',()=>down=false);
+document.getElementById('go').onclick=()=>setTarget(+document.getElementById('x').value,+document.getElementById('y').value);
+[['p_tau','tau',1],['p_use','use',.01],['p_ms','ms',1],['p_ml','ml',1],['p_pay','pay',1],['p_spd','spd',.01]].forEach(([id,k,m])=>{
+ document.getElementById(id).addEventListener('input',e=>{const v=parseFloat(e.target.value);if(isFinite(v)){P[k]=v*m;setTarget(...target,true)}})});
+setTarget(15,20,true);cur=[...theta];draw();
+</script>
+</body>
+</html>
